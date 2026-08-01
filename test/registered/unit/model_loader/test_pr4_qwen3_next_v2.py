@@ -70,52 +70,38 @@ def _shard_recording_param(recorded_shards):
 
 
 @pytest.mark.parametrize(
-    "name,fusion,num_experts,expected",
+    "name,expected",
     [
         # self_attn is folded directly onto the decoder layer.
         (
             "model.layers.0.self_attn.q_proj.weight",
-            False,
-            8,
             "model.layers.0.q_proj.weight",
-        ),
-        # Shared expert moves into the routed slot only when fusion is enabled.
-        (
-            "model.layers.3.mlp.shared_expert.gate_proj.weight",
-            True,
-            8,
-            "model.layers.3.mlp.experts.8.gate_proj.weight",
-        ),
-        (
-            "model.layers.3.mlp.shared_expert.gate_proj.weight",
-            False,
-            8,
-            "model.layers.3.mlp.shared_expert.gate_proj.weight",
         ),
         # modelopt FP8 kv scales live on the attention module, not the proj.
         (
             "model.layers.1.self_attn.k_proj.k_scale",
-            False,
-            4,
             "model.layers.1.attn.k_scale",
         ),
         (
             "model.layers.1.self_attn.v_proj.v_scale",
-            False,
-            4,
             "model.layers.1.attn.v_scale",
         ),
     ],
 )
-def test_remap_checkpoint_name(name, fusion, num_experts, expected):
-    assert (
-        remap_qwen3_next_checkpoint_name(
-            name,
-            enable_shared_expert_fusion=fusion,
-            num_experts=num_experts,
-        )
-        == expected
-    )
+def test_remap_checkpoint_name(name, expected):
+    assert remap_qwen3_next_checkpoint_name(name) == expected
+
+
+def test_shared_expert_names_reach_the_moe_block_unrewritten():
+    """Shared-expert keys must not be pre-renamed to the routed slot.
+
+    The MoE block's loader maps ``shared_expert.*`` directly into the fused slot.
+    Rewriting it to ``experts.<slot>.*`` here instead yields a key that matches no
+    expert mapping, and the block then rejects it as an unknown parameter — a
+    load-time failure whenever shared-expert fusion is enabled.
+    """
+    name = "model.layers.3.mlp.shared_expert.gate_proj.weight"
+    assert remap_qwen3_next_checkpoint_name(name) == name
 
 
 def test_mtp_pass_keeps_only_draft_tensors():
@@ -128,8 +114,6 @@ def test_mtp_pass_keeps_only_draft_tensors():
         iter_qwen3_next_checkpoint_weights(
             weights,
             is_mtp=True,
-            enable_shared_expert_fusion=False,
-            num_experts=4,
         )
     )
     # "mtp.fc.weight" keeps its bare name; other mtp keys move onto model.*.
@@ -149,8 +133,6 @@ def test_base_pass_drops_draft_tensors():
         iter_qwen3_next_checkpoint_weights(
             weights,
             is_mtp=False,
-            enable_shared_expert_fusion=False,
-            num_experts=4,
         )
     )
     assert [name for name, _ in out] == ["model.norm.weight"]
@@ -163,8 +145,6 @@ def test_homeless_unit_scale_is_dropped_but_non_unit_scale_raises():
             iter_qwen3_next_checkpoint_weights(
                 unit,
                 is_mtp=False,
-                enable_shared_expert_fusion=False,
-                num_experts=4,
                 params_dict={},
             )
         )
@@ -177,8 +157,6 @@ def test_homeless_unit_scale_is_dropped_but_non_unit_scale_raises():
             iter_qwen3_next_checkpoint_weights(
                 off,
                 is_mtp=False,
-                enable_shared_expert_fusion=False,
-                num_experts=4,
                 params_dict={},
             )
         )

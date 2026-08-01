@@ -1030,15 +1030,14 @@ _QWEN3_NEXT_MTP_UNPREFIXED_NAMES = frozenset(
 )
 
 
-def remap_qwen3_next_checkpoint_name(
-    name: str,
-    *,
-    enable_shared_expert_fusion: bool,
-    num_experts: int,
-) -> str:
-    """Rewrite one checkpoint key onto the Qwen3-Next runtime module tree."""
-    if enable_shared_expert_fusion and "mlp.shared_expert." in name:
-        name = name.replace("mlp.shared_expert.", f"mlp.experts.{num_experts}.")
+def remap_qwen3_next_checkpoint_name(name: str) -> str:
+    """Rewrite one checkpoint key onto the Qwen3-Next runtime module tree.
+
+    Shared-expert fusion is deliberately *not* remapped here. The MoE block's own
+    loader maps ``shared_expert.*`` straight into the fused routed slot, so
+    rewriting it to ``experts.<slot>.*`` first would produce a key that matches no
+    expert mapping and fail the block's completeness check.
+    """
     if ".self_attn." in name:
         name = name.replace(".self_attn", "")
     # modelopt FP8 kv-cache scales live on the attention module, not the proj.
@@ -1053,8 +1052,6 @@ def iter_qwen3_next_checkpoint_weights(
     weights: Iterable[Tuple[str, torch.Tensor]],
     *,
     is_mtp: bool,
-    enable_shared_expert_fusion: bool,
-    num_experts: int,
     params_dict: Optional[dict[str, nn.Parameter]] = None,
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     """Select and rename checkpoint entries for one Qwen3-Next runtime tree.
@@ -1078,11 +1075,7 @@ def iter_qwen3_next_checkpoint_weights(
         if "rotary_emb.inv_freq" in name:
             continue
 
-        name = remap_qwen3_next_checkpoint_name(
-            name,
-            enable_shared_expert_fusion=enable_shared_expert_fusion,
-            num_experts=num_experts,
-        )
+        name = remap_qwen3_next_checkpoint_name(name)
 
         if (
             params_dict is not None
@@ -1239,14 +1232,15 @@ class Qwen3NextForCausalLM(nn.Module):
     def _load_weights_v2(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
-        """Walker-based load; submodules own stacked/GDN/expert dispatch."""
+        """Walker-based load; submodules own stacked/GDN/expert dispatch.
+
+        Shared-expert fusion is handled by the MoE block's loader, not here.
+        """
         from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
 
         weights = iter_qwen3_next_checkpoint_weights(
             weights,
             is_mtp=is_mtp,
-            enable_shared_expert_fusion=self.enable_shared_expert_fusion,
-            num_experts=self.config.num_experts,
             params_dict=dict(self.named_parameters()),
         )
         loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=[".bias"])
