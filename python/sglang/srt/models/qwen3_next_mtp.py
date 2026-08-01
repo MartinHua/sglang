@@ -151,7 +151,9 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
-        super().load_weights(weights, is_mtp=True)
+        # Inherits the parent's v1/v2 gate; forward the loaded-name set so the
+        # wrapper honors the same contract as the base loader.
+        return super().load_weights(weights, is_mtp=True)
 
 
 EntryClass = [Qwen3NextForCausalLMMTP]

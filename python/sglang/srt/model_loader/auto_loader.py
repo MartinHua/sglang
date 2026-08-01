@@ -377,9 +377,7 @@ def load_with_stacked_dispatch(
             wl(params_dict[name], tensor)
             loaded.add(name)
         elif not any(name.endswith(suffix) for suffix in ignore_unexpected_suffixes):
-            raise ValueError(
-                f"No parameter named {name!r} in {module._get_name()}."
-            )
+            raise ValueError(f"No parameter named {name!r} in {module._get_name()}.")
     return loaded
 
 
@@ -428,9 +426,7 @@ def load_moe_sparse_block_weights(
                 )
             continue
         if name not in params_dict:
-            raise ValueError(
-                f"No parameter named {name!r} in {module._get_name()}."
-            )
+            raise ValueError(f"No parameter named {name!r} in {module._get_name()}.")
         wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
         wl(params_dict[name], tensor)
         loaded.add(name)

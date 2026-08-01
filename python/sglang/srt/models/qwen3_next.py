@@ -321,9 +321,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             load_with_stacked_dispatch,
         )
 
-        return load_with_stacked_dispatch(
-            self, weights, QWEN3_NEXT_GDN_STACKED_MAPPING
-        )
+        return load_with_stacked_dispatch(self, weights, QWEN3_NEXT_GDN_STACKED_MAPPING)
 
     def create_qkvz_proj(
         self,
