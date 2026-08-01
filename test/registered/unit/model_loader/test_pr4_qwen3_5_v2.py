@@ -28,6 +28,7 @@ from sglang.srt.models.qwen3_5 import (  # noqa: E402
     Qwen3_5AttentionDecoderLayer,
     iter_qwen3_5_text_checkpoint_weights,
 )
+from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=8, suite="base-b-test-cpu")
@@ -145,6 +146,52 @@ def test_attention_layer_forwards_mlp_weights_to_the_moe_loader():
     assert qkv_shards == ["q"]
     assert "mlp.experts.0.gate_proj.weight" in loaded
     assert "qkv_proj.weight" in loaded
+
+
+# ---------------------------------------------------------------------------
+# MTP wrapper routing
+# ---------------------------------------------------------------------------
+
+
+def test_mtp_splits_own_projections_from_the_draft_body():
+    """The MTP wrapper keeps ``fc``/pre-fc norms and forwards the rest to the body.
+
+    The draft shares a checkpoint with its target, so base-model keys must be
+    dropped; and only the ``mtp.`` prefix may select the draft branch — a bare
+    substring match could forward a malformed key to the body with a stale path.
+    """
+    mtp = Qwen3_5ForCausalLMMTP.__new__(Qwen3_5ForCausalLMMTP)
+    nn.Module.__init__(mtp)
+    body_seen = []
+
+    class _RecordingBody(nn.Module):
+        def load_weights(self, weights):
+            names = _names(weights)
+            body_seen.extend(names)
+            return set(names)
+
+    mtp.add_module("model", _RecordingBody())
+    for own in ("fc", "pre_fc_norm_embedding", "pre_fc_norm_hidden"):
+        module = nn.Module()
+        module.register_parameter("weight", nn.Parameter(torch.zeros(1)))
+        mtp.add_module(own, module)
+
+    loaded = mtp._load_weights_v2(
+        _stream(
+            "mtp.fc.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.norm.weight",
+            # Target-model weights share the stream and must not be loaded here.
+            "model.layers.5.self_attn.q_proj.weight",
+        )
+    )
+
+    assert body_seen == ["layers.0.self_attn.q_proj.weight", "norm.weight"]
+    assert {"fc.weight", "pre_fc_norm_hidden.weight"} <= loaded
+    # Body names come back re-prefixed so they match this module's param names.
+    assert "model.layers.0.self_attn.q_proj.weight" in loaded
+    assert not any(name.startswith("model.layers.5") for name in loaded)
 
 
 if __name__ == "__main__":
