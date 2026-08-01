@@ -38,10 +38,7 @@ __all__ = [
     "STANDARD_STACKED_MAPPING",
     "LLAMA_STACKED_MAPPING",
     "QWEN3_NEXT_GDN_STACKED_MAPPING",
-    "QWEN35_GDN_STACKED_MAPPING",
-    "QWEN35_STACKED_MAPPING",
     "MOE_EXPERT_STACKED_SKIP_SUBSTRS",
-    "normalize_qwen35_weight_name",
     "split_submodule_weights",
     "try_load_stacked_skip_moe_experts",
     "load_with_stacked_dispatch",
@@ -127,13 +124,6 @@ QWEN3_NEXT_GDN_STACKED_MAPPING = StackedParamsDispatch(
         ("in_proj_ba.", "in_proj_b.", 0),
         ("in_proj_ba.", "in_proj_a.", 1),
     )
-)
-
-# Qwen3.5 reuses the Qwen3-Next mixer packing verbatim.
-QWEN35_GDN_STACKED_MAPPING = QWEN3_NEXT_GDN_STACKED_MAPPING
-
-QWEN35_STACKED_MAPPING = StackedParamsDispatch(
-    mappings=STANDARD_STACKED_MAPPING.mappings + QWEN35_GDN_STACKED_MAPPING.mappings
 )
 
 MOE_EXPERT_STACKED_SKIP_SUBSTRS: tuple[str, ...] = ("mlp.experts", "experts.")
@@ -248,17 +238,19 @@ class FusedExpertDispatch(msgspec.Struct, frozen=True):
     w13_runtime_substr: str = "experts.w13_weight"
     w2_runtime_substr: str = "experts.w2_weight"
 
-    @staticmethod
-    def fan_out_to_experts(
+    def _fan_out_to_experts(
+        self,
+        *,
         param: Parameter,
         loaded_weight: torch.Tensor,
         runtime_name: str,
         shard_id: str,
-        num_experts: int,
     ) -> None:
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        for expert_id in range(num_experts):
-            weight_loader(
+        # Fused expert params always carry a FusedMoE weight_loader; the
+        # default loader takes only (param, tensor) and could not accept the
+        # shard/expert arguments, so access it directly and fail loudly.
+        for expert_id in range(self.num_experts):
+            param.weight_loader(
                 param,
                 loaded_weight[expert_id],
                 runtime_name,
@@ -268,6 +260,7 @@ class FusedExpertDispatch(msgspec.Struct, frozen=True):
 
     def _resolve(
         self,
+        *,
         name: str,
         ckpt_substr: str,
         runtime_substr: str,
@@ -290,31 +283,31 @@ class FusedExpertDispatch(msgspec.Struct, frozen=True):
     ) -> str | None:
         if self.gate_up_ckpt_substr in name:
             target, param = self._resolve(
-                name, self.gate_up_ckpt_substr, self.w13_runtime_substr, params_dict
+                name=name,
+                ckpt_substr=self.gate_up_ckpt_substr,
+                runtime_substr=self.w13_runtime_substr,
+                params_dict=params_dict,
             )
             w1, w3 = tensor.chunk(2, dim=-2)
-            self.fan_out_to_experts(param, w1, target, "w1", self.num_experts)
-            self.fan_out_to_experts(param, w3, target, "w3", self.num_experts)
+            self._fan_out_to_experts(
+                param=param, loaded_weight=w1, runtime_name=target, shard_id="w1"
+            )
+            self._fan_out_to_experts(
+                param=param, loaded_weight=w3, runtime_name=target, shard_id="w3"
+            )
             return target
         if self.down_ckpt_substr in name:
             target, param = self._resolve(
-                name, self.down_ckpt_substr, self.w2_runtime_substr, params_dict
+                name=name,
+                ckpt_substr=self.down_ckpt_substr,
+                runtime_substr=self.w2_runtime_substr,
+                params_dict=params_dict,
             )
-            self.fan_out_to_experts(param, tensor, target, "w2", self.num_experts)
+            self._fan_out_to_experts(
+                param=param, loaded_weight=tensor, runtime_name=target, shard_id="w2"
+            )
             return target
         return None
-
-
-def normalize_qwen35_weight_name(name: str) -> str:
-    """Strip Qwen3.5/Qwen3-Next wrapper prefixes the runtime tree does not have.
-
-    ``model.language_model.`` appears in conditional-generation checkpoints, and
-    the runtime folds ``self_attn`` directly into the decoder layer.
-    """
-    name = name.replace("model.language_model.", "model.")
-    if ".self_attn." in name:
-        name = name.replace(".self_attn", "")
-    return name
 
 
 def split_submodule_weights(

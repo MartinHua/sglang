@@ -55,7 +55,6 @@ def _install_param(module, name, loader):
     param = nn.Parameter(torch.zeros(1), requires_grad=False)
     param.weight_loader = loader
     target.register_parameter(parts[-1], param)
-    return param
 
 
 def _shard_recording_param(recorded_shards):
@@ -114,6 +113,7 @@ def test_mtp_pass_keeps_only_draft_tensors():
         iter_qwen3_next_checkpoint_weights(
             weights,
             is_mtp=True,
+            params_dict={},
         )
     )
     # "mtp.fc.weight" keeps its bare name; other mtp keys move onto model.*.
@@ -133,6 +133,7 @@ def test_base_pass_drops_draft_tensors():
         iter_qwen3_next_checkpoint_weights(
             weights,
             is_mtp=False,
+            params_dict={},
         )
     )
     assert [name for name, _ in out] == ["model.norm.weight"]

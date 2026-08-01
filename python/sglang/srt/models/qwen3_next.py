@@ -321,7 +321,9 @@ class Qwen3GatedDeltaNet(nn.Module):
             load_with_stacked_dispatch,
         )
 
-        return load_with_stacked_dispatch(self, weights, QWEN3_NEXT_GDN_STACKED_MAPPING)
+        return load_with_stacked_dispatch(
+            self, weights, mapping=QWEN3_NEXT_GDN_STACKED_MAPPING
+        )
 
     def create_qkvz_proj(
         self,
@@ -909,7 +911,9 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
         mlp_weights, own_weights = split_submodule_weights(weights, prefix="mlp.")
         loaded = {f"mlp.{name}" for name in self.mlp.load_weights(mlp_weights)}
-        loaded |= load_with_stacked_dispatch(self, own_weights, STANDARD_QKV_MAPPING)
+        loaded |= load_with_stacked_dispatch(
+            self, own_weights, mapping=STANDARD_QKV_MAPPING
+        )
         return loaded
 
 
@@ -1052,14 +1056,15 @@ def iter_qwen3_next_checkpoint_weights(
     weights: Iterable[Tuple[str, torch.Tensor]],
     *,
     is_mtp: bool,
-    params_dict: Optional[dict[str, nn.Parameter]] = None,
+    params_dict: dict[str, nn.Parameter],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     """Select and rename checkpoint entries for one Qwen3-Next runtime tree.
 
     The MTP draft and the base model share a checkpoint: ``is_mtp`` keeps only
     the ``mtp.*`` tensors (renamed onto the draft tree) and the base pass drops
     them. Unit-valued quantization scales with no runtime home are dropped after
-    an explicit check rather than silently.
+    an explicit check rather than silently; ``params_dict`` is required so that
+    check can never be skipped by accident.
     """
     for name, loaded_weight in weights:
         if is_mtp:
@@ -1077,11 +1082,7 @@ def iter_qwen3_next_checkpoint_weights(
 
         name = remap_qwen3_next_checkpoint_name(name)
 
-        if (
-            params_dict is not None
-            and name.endswith("_scale")
-            and name not in params_dict
-        ):
+        if name.endswith("_scale") and name not in params_dict:
             assert (
                 abs(loaded_weight.item() - 1.0) < 1e-6
             ), f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
