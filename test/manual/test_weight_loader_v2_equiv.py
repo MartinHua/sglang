@@ -73,6 +73,20 @@ MODEL_CASES = [
         "Qwen2ForSequenceClassification",
         model_type="embedding",
     ),
+    # PR4 (#31051) hybrid gated-delta-net families. No tiny-random fixture is
+    # published for either, so these default to the smallest real checkpoints;
+    # resolution is local-only, so they skip unless already cached. Point
+    # SGLANG_WEIGHT_LOADER_V2_<CATEGORY>_MODEL at a smaller stand-in if one exists.
+    ModelCase(
+        "hybrid_gdn_dense",
+        "Qwen/Qwen3.5-4B",
+        "Qwen3_5ForCausalLM",
+    ),
+    ModelCase(
+        "hybrid_mamba",
+        "Qwen/Qwen3-Next-80B-A3B-Instruct",
+        "Qwen3NextForCausalLM",
+    ),
 ]
 
 
@@ -97,9 +111,7 @@ def _init_model_parallel() -> None:
         pass
 
 
-def _load_native_model(
-    model_path: str, v2: bool, model_type: str
-) -> torch.nn.Module:
+def _load_native_model(model_path: str, v2: bool, model_type: str) -> torch.nn.Module:
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
@@ -141,9 +153,7 @@ def _require_cached_checkpoint(case: ModelCase) -> str:
 
             cached_path = Path(snapshot_download(model, local_files_only=True))
         except Exception as exc:
-            pytest.skip(
-                f"{case.category}: {model!r} is not cached locally ({exc})"
-            )
+            pytest.skip(f"{case.category}: {model!r} is not cached locally ({exc})")
 
     weight_files = [
         *cached_path.glob("*.safetensors"),

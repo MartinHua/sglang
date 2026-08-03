@@ -17,7 +17,7 @@
 import copy
 import logging
 from contextlib import ExitStack
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -42,6 +42,14 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
+
+# Checkpoint keys the MTP wrapper owns; everything else under ``mtp.`` belongs to
+# the draft body and is forwarded to its loader.
+_MTP_OWN_PARAM_PREFIXES = (
+    "fc.",
+    "pre_fc_norm_embedding.",
+    "pre_fc_norm_hidden.",
+)
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
@@ -208,6 +216,49 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         )
 
     def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights, is_mtp=is_mtp)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        """Split the MTP checkpoint between this wrapper and the draft body.
+
+        The draft is a full ``Qwen3_5ForCausalLM``, so hand it the body-relative
+        stream and let it own stacked / GDN / expert dispatch rather than keeping a
+        second copy of those mapping tables here. Only the wrapper's own
+        projections (``fc``, the two pre-fc norms) are loaded locally.
+
+        ``embed_tokens`` and ``lm_head`` are not checkpoint-loaded on this path —
+        they are installed from the target model by ``set_embed_and_head`` /
+        ``set_lm_head_from_target``.
+        """
+        params_dict = dict(self.named_parameters())
+        loaded: Set[str] = set()
+        body_weights: List[Tuple[str, torch.Tensor]] = []
+
+        for name, loaded_weight in weights:
+            # The MTP draft shares a checkpoint with its target; keep only the
+            # draft branch. Match the prefix rather than a bare substring so a
+            # malformed key can never be forwarded to the body with a stale path.
+            if not name.startswith("mtp."):
+                continue
+            name = name[len("mtp.") :]
+            if name.startswith(_MTP_OWN_PARAM_PREFIXES):
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded.add(name)
+                continue
+            body_weights.append((name, loaded_weight))
+
+        loaded |= {f"model.{n}" for n in self.model.load_weights(body_weights)}
+        return loaded
+
+    def _legacy_load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
         stacked_params_mapping = [

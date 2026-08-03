@@ -32,11 +32,14 @@ __all__ = [
     "WeightsMapper",
     "StackedParamsDispatch",
     "ExpertParamsDispatch",
+    "FusedExpertDispatch",
     "STANDARD_QKV_MAPPING",
     "STANDARD_GATE_UP_MAPPING",
     "STANDARD_STACKED_MAPPING",
     "LLAMA_STACKED_MAPPING",
+    "QWEN3_NEXT_GDN_STACKED_MAPPING",
     "MOE_EXPERT_STACKED_SKIP_SUBSTRS",
+    "split_submodule_weights",
     "try_load_stacked_skip_moe_experts",
     "load_with_stacked_dispatch",
     "load_moe_sparse_block_weights",
@@ -107,6 +110,19 @@ LLAMA_STACKED_MAPPING = StackedParamsDispatch(
         (".qkv_proj", ".v_proj", "v"),
         (".gate_up_proj", ".gate_proj", 0),
         (".gate_up_proj", ".up_proj", 1),
+    )
+)
+
+# Qwen3-Next / Qwen3.5 gated-delta-net packing. The checkpoint stores the mixer
+# projections split (in_proj_qkv / in_proj_z, in_proj_b / in_proj_a) while the
+# runtime holds them fused. Trailing dots keep "in_proj_qkv." from matching
+# "in_proj_qkvz." and "in_proj_b." from matching "in_proj_ba.".
+QWEN3_NEXT_GDN_STACKED_MAPPING = StackedParamsDispatch(
+    mappings=(
+        ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+        ("in_proj_qkvz.", "in_proj_z.", 3),
+        ("in_proj_ba.", "in_proj_b.", 0),
+        ("in_proj_ba.", "in_proj_a.", 1),
     )
 )
 
@@ -206,6 +222,117 @@ class ExpertParamsDispatch(msgspec.Struct, frozen=True):
         return None
 
 
+class FusedExpertDispatch(msgspec.Struct, frozen=True):
+    """Fan one fused expert checkpoint tensor out to per-expert shard records.
+
+    Qwen3.5-style checkpoints stack every expert into a single
+    ``experts.gate_up_proj`` / ``experts.down_proj`` tensor whose leading dim is
+    the expert index, while the runtime keeps ``w13_weight`` / ``w2_weight``
+    tensors loaded one expert at a time. ``gate_up_proj`` additionally packs w1
+    and w3 along the penultimate dim.
+    """
+
+    num_experts: int
+    gate_up_ckpt_substr: str = "experts.gate_up_proj"
+    down_ckpt_substr: str = "experts.down_proj"
+    w13_runtime_substr: str = "experts.w13_weight"
+    w2_runtime_substr: str = "experts.w2_weight"
+
+    def _fan_out_to_experts(
+        self,
+        *,
+        param: Parameter,
+        loaded_weight: torch.Tensor,
+        runtime_name: str,
+        shard_id: str,
+    ) -> None:
+        # Fused expert params always carry a FusedMoE weight_loader; the
+        # default loader takes only (param, tensor) and could not accept the
+        # shard/expert arguments, so access it directly and fail loudly.
+        for expert_id in range(self.num_experts):
+            param.weight_loader(
+                param,
+                loaded_weight[expert_id],
+                runtime_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+
+    def _resolve(
+        self,
+        *,
+        name: str,
+        ckpt_substr: str,
+        runtime_substr: str,
+        params_dict: dict[str, Parameter],
+    ) -> tuple[str, Parameter]:
+        target = name.replace(ckpt_substr, runtime_substr)
+        param = params_dict.get(target)
+        if param is None:
+            raise ValueError(
+                f"Mapped fused expert weight {name!r} to missing parameter "
+                f"{target!r}"
+            )
+        return target, param
+
+    def try_load(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        params_dict: dict[str, Parameter],
+    ) -> str | None:
+        if self.gate_up_ckpt_substr in name:
+            target, param = self._resolve(
+                name=name,
+                ckpt_substr=self.gate_up_ckpt_substr,
+                runtime_substr=self.w13_runtime_substr,
+                params_dict=params_dict,
+            )
+            w1, w3 = tensor.chunk(2, dim=-2)
+            self._fan_out_to_experts(
+                param=param, loaded_weight=w1, runtime_name=target, shard_id="w1"
+            )
+            self._fan_out_to_experts(
+                param=param, loaded_weight=w3, runtime_name=target, shard_id="w3"
+            )
+            return target
+        if self.down_ckpt_substr in name:
+            target, param = self._resolve(
+                name=name,
+                ckpt_substr=self.down_ckpt_substr,
+                runtime_substr=self.w2_runtime_substr,
+                params_dict=params_dict,
+            )
+            self._fan_out_to_experts(
+                param=param, loaded_weight=tensor, runtime_name=target, shard_id="w2"
+            )
+            return target
+        return None
+
+
+def split_submodule_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    *,
+    prefix: str,
+) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, torch.Tensor]]]:
+    """Partition checkpoint entries into ``(under_prefix, remainder)``.
+
+    Names under ``prefix`` are yielded with the prefix stripped so they can be
+    handed to that submodule's own ``load_weights``. Needed when a module owns
+    both fused params of its own and a child that must keep its own loader: the
+    walker delegates a whole subtree to the first module defining
+    ``load_weights``, so the child has to be re-entered explicitly.
+    """
+    under_prefix: list[tuple[str, torch.Tensor]] = []
+    remainder: list[tuple[str, torch.Tensor]] = []
+    for name, tensor in weights:
+        if name.startswith(prefix):
+            under_prefix.append((name[len(prefix) :], tensor))
+        else:
+            remainder.append((name, tensor))
+    return under_prefix, remainder
+
+
 def load_with_stacked_dispatch(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
@@ -243,9 +370,7 @@ def load_with_stacked_dispatch(
             wl(params_dict[name], tensor)
             loaded.add(name)
         elif not any(name.endswith(suffix) for suffix in ignore_unexpected_suffixes):
-            raise ValueError(
-                f"No parameter named {name!r} in {module._get_name()}."
-            )
+            raise ValueError(f"No parameter named {name!r} in {module._get_name()}.")
     return loaded
 
 
@@ -294,9 +419,7 @@ def load_moe_sparse_block_weights(
                 )
             continue
         if name not in params_dict:
-            raise ValueError(
-                f"No parameter named {name!r} in {module._get_name()}."
-            )
+            raise ValueError(f"No parameter named {name!r} in {module._get_name()}.")
         wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
         wl(params_dict[name], tensor)
         loaded.add(name)

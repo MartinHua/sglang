@@ -309,6 +309,22 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         return weight_loader
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        """Load the gated-delta-net mixer via packed GDN stacked dispatch.
+
+        Split checkpoints route ``in_proj_qkv``/``in_proj_z`` and
+        ``in_proj_b``/``in_proj_a`` into the fused runtime params with a shard
+        id; fused checkpoints land on the packed loader directly (shard_id=None).
+        """
+        from sglang.srt.model_loader.auto_loader import (
+            QWEN3_NEXT_GDN_STACKED_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(
+            self, weights, mapping=QWEN3_NEXT_GDN_STACKED_MAPPING
+        )
+
     def create_qkvz_proj(
         self,
         hidden_size: int,
@@ -876,6 +892,30 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
         return hidden_states, residual
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        """Load the attention decoder layer.
+
+        Qwen3-Next inlines ``qkv_proj``/``o_proj`` onto the decoder layer instead
+        of a nested attention module, so this layer is the only place where the
+        split checkpoint names (``q_proj``/``k_proj``/``v_proj``) and the fused
+        runtime param are both visible. Because the walker hands a whole subtree
+        to the first module that defines ``load_weights``, the ``mlp.`` weights
+        must be forwarded explicitly to the MoE/dense block's own loader — they
+        would otherwise never reach expert dispatch.
+        """
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_QKV_MAPPING,
+            load_with_stacked_dispatch,
+            split_submodule_weights,
+        )
+
+        mlp_weights, own_weights = split_submodule_weights(weights, prefix="mlp.")
+        loaded = {f"mlp.{name}" for name in self.mlp.load_weights(mlp_weights)}
+        loaded |= load_with_stacked_dispatch(
+            self, own_weights, mapping=STANDARD_QKV_MAPPING
+        )
+        return loaded
+
 
 ALL_DECODER_LAYER_TYPES = {
     "attention": Qwen3HybridAttentionDecoderLayer,
@@ -983,6 +1023,72 @@ class Qwen3NextModel(nn.Module):
             return hidden_states
 
         return hidden_states, aux_hidden_states
+
+
+_QWEN3_NEXT_MTP_UNPREFIXED_NAMES = frozenset(
+    {
+        "mtp.fc.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    }
+)
+
+
+def remap_qwen3_next_checkpoint_name(name: str) -> str:
+    """Rewrite one checkpoint key onto the Qwen3-Next runtime module tree.
+
+    Shared-expert fusion is deliberately *not* remapped here. The MoE block's own
+    loader maps ``shared_expert.*`` straight into the fused routed slot, so
+    rewriting it to ``experts.<slot>.*`` first would produce a key that matches no
+    expert mapping and fail the block's completeness check.
+    """
+    if ".self_attn." in name:
+        name = name.replace(".self_attn", "")
+    # modelopt FP8 kv-cache scales live on the attention module, not the proj.
+    if name.endswith(".k_proj.k_scale"):
+        name = name.replace(".k_proj.k_scale", ".attn.k_scale")
+    elif name.endswith(".v_proj.v_scale"):
+        name = name.replace(".v_proj.v_scale", ".attn.v_scale")
+    return name
+
+
+def iter_qwen3_next_checkpoint_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    *,
+    is_mtp: bool,
+    params_dict: dict[str, nn.Parameter],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Select and rename checkpoint entries for one Qwen3-Next runtime tree.
+
+    The MTP draft and the base model share a checkpoint: ``is_mtp`` keeps only
+    the ``mtp.*`` tensors (renamed onto the draft tree) and the base pass drops
+    them. Unit-valued quantization scales with no runtime home are dropped after
+    an explicit check rather than silently; ``params_dict`` is required so that
+    check can never be skipped by accident.
+    """
+    for name, loaded_weight in weights:
+        if is_mtp:
+            if "mtp" not in name:
+                continue
+            if name in _QWEN3_NEXT_MTP_UNPREFIXED_NAMES:
+                name = name.replace("mtp.", "")
+            else:
+                name = name.replace("mtp", "model")
+        elif "mtp" in name:
+            continue
+
+        if "rotary_emb.inv_freq" in name:
+            continue
+
+        name = remap_qwen3_next_checkpoint_name(name)
+
+        if name.endswith("_scale") and name not in params_dict:
+            assert (
+                abs(loaded_weight.item() - 1.0) < 1e-6
+            ), f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
+            continue
+
+        yield name, loaded_weight
 
 
 class HybridLayerType(enum.Enum):
@@ -1116,6 +1222,35 @@ class Qwen3NextForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ) -> Set[str]:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights, is_mtp=is_mtp)
+        return self._legacy_load_weights(weights, is_mtp=is_mtp)
+
+    def _load_weights_v2(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ) -> Set[str]:
+        """Walker-based load; submodules own stacked/GDN/expert dispatch.
+
+        Shared-expert fusion is handled by the MoE block's loader, not here.
+        """
+        from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+
+        weights = iter_qwen3_next_checkpoint_weights(
+            weights,
+            is_mtp=is_mtp,
+            params_dict=dict(self.named_parameters()),
+        )
+        # No ".kv_scale" here on purpose: the generator above already resolves
+        # every homeless "*_scale" key, so none reach the walker. Qwen3.5 has no
+        # such check in its generator and does need the suffix ignored.
+        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=[".bias"])
+        return loader.load_weights(weights)
+
+    def _legacy_load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
         stacked_params_mapping = [
