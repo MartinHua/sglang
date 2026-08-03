@@ -1244,6 +1244,9 @@ class Qwen3NextForCausalLM(nn.Module):
             is_mtp=is_mtp,
             params_dict=dict(self.named_parameters()),
         )
+        # No ".kv_scale" here on purpose: the generator above already resolves
+        # every homeless "*_scale" key, so none reach the walker. Qwen3.5 has no
+        # such check in its generator and does need the suffix ignored.
         loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=[".bias"])
         return loader.load_weights(weights)
 

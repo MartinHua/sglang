@@ -72,6 +72,25 @@ WRAPPER = ModelCase(
     model_type="embedding",
 )
 
+# PR4 (#31051) hybrid gated-delta-net families. Unlike the cases above, no
+# tiny-random fixture is published for either, and the smallest real checkpoints
+# are 4B / 80B. This resolver downloads rather than reading the local cache, so
+# the defaults are deliberately unresolvable placeholders: both cases skip with a
+# message naming the env var until a small fixture exists. Set
+# SGLANG_WEIGHT_LOADER_V2_HYBRID_GDN_DENSE_MODEL=Qwen/Qwen3.5-4B (or a stand-in)
+# to run them locally. Bit-exact coverage lives in
+# test/manual/test_weight_loader_v2_equiv.py, which is cache-only.
+HYBRID_GDN_DENSE = ModelCase(
+    "hybrid_gdn_dense",
+    "TODO-tiny-random-Qwen3_5ForCausalLM",
+    "Qwen3_5ForCausalLM",
+)
+HYBRID_MAMBA = ModelCase(
+    "hybrid_mamba",
+    "TODO-tiny-random-Qwen3NextForCausalLM",
+    "Qwen3NextForCausalLM",
+)
+
 
 @lru_cache(maxsize=None)
 def _resolve_model(case: ModelCase) -> tuple[str | None, str | None]:
@@ -184,6 +203,12 @@ class TestWeightLoaderV2E2E(CustomTestCase):
 
     def test_wrapper_qwen2_sequence_classification_v1_v2_embedding_match(self):
         self._assert_embedding_wrapper_equivalent(WRAPPER)
+
+    def test_hybrid_gdn_dense_qwen3_5_v1_v2_generation_match(self):
+        self._assert_generation_equivalent(HYBRID_GDN_DENSE)
+
+    def test_hybrid_mamba_qwen3_next_v1_v2_generation_match(self):
+        self._assert_generation_equivalent(HYBRID_MAMBA)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,9 @@ for _submodule in (
 
 from sglang.srt.model_loader.auto_loader import (  # noqa: E402
     QWEN3_NEXT_GDN_STACKED_MAPPING,
+    AutoWeightsLoader,
     FusedExpertDispatch,
+    filter_pp_weights,
 )
 from sglang.srt.models.qwen3_next import (  # noqa: E402
     Qwen3HybridAttentionDecoderLayer,
@@ -35,7 +37,15 @@ from sglang.srt.models.qwen3_next import (  # noqa: E402
 )
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+
+
+def _names(weights):
+    return [name for name, _ in weights]
+
+
+def _stream(*names):
+    return [(name, torch.zeros(1)) for name in names]
 
 
 def _bare(cls):
@@ -281,6 +291,52 @@ def test_fused_expert_dispatch_rejects_missing_runtime_target():
     dispatch = FusedExpertDispatch(num_experts=2)
     with pytest.raises(ValueError, match="missing parameter"):
         dispatch.try_load("experts.gate_up_proj", torch.zeros(2, 4, 3), {})
+
+
+# ---------------------------------------------------------------------------
+# Shared v2 invariants
+# ---------------------------------------------------------------------------
+
+
+def test_pp_filter_drops_layers_outside_this_rank():
+    kept = list(
+        filter_pp_weights(
+            _stream(
+                "model.layers.0.q_proj.weight",
+                "model.layers.2.q_proj.weight",
+                "model.layers.4.q_proj.weight",
+                # No parseable layer index -> always passed through.
+                "model.norm.weight",
+            ),
+            start_layer=2,
+            end_layer=4,
+        )
+    )
+    assert _names(kept) == ["model.layers.2.q_proj.weight", "model.norm.weight"]
+
+
+def test_walker_rejects_an_unexpected_checkpoint_name():
+    """v2's contract is no silent drops: an unknown key must fail the load."""
+    module = nn.Module()
+    inner = nn.Module()
+    inner.register_parameter("weight", nn.Parameter(torch.zeros(1)))
+    module.add_module("known", inner)
+
+    loader = AutoWeightsLoader(module)
+    with pytest.raises(ValueError, match="No module or parameter named"):
+        loader.load_weights(_stream("unknown.weight"))
+
+
+def test_walker_ignores_only_declared_suffixes():
+    module = nn.Module()
+    inner = nn.Module()
+    inner.register_parameter("weight", nn.Parameter(torch.zeros(1)))
+    module.add_module("known", inner)
+
+    loader = AutoWeightsLoader(module, ignore_unexpected_suffixes=[".bias"])
+    assert loader.load_weights(_stream("absent.bias")) == set()
+    with pytest.raises(ValueError):
+        loader.load_weights(_stream("absent.kv_scale"))
 
 
 if __name__ == "__main__":
